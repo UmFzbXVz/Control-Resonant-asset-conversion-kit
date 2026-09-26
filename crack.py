@@ -727,16 +727,35 @@ def main():
         if m:
             found[int(m.group(1))] = path
 
-    # Same archive → file-number mapping as the original working script
-    BLOBS = {
-        0: found.get(0),
-        1: found.get(5),
-        2: None,
-        3: found.get(1),
-        4: found.get(2),
-        5: found.get(3),
-        6: found.get(4),
-    }
+    if name.lower().startswith("stream"):
+        BLOBS = {
+            0: found.get(0),
+            1: found.get(15),
+            2: found.get(1),
+            3: found.get(2),
+            4: found.get(3),
+            5: found.get(4),
+            6: found.get(5),
+            7: found.get(6),
+            8: found.get(7),
+            9: found.get(8),
+            10: found.get(9),
+            11: found.get(10),
+            12: found.get(11),
+            13: found.get(12),
+            14: found.get(13),
+            15: found.get(14),
+        }
+    else:
+        BLOBS = {
+            0: found.get(0),
+            1: found.get(5),
+            2: None,
+            3: found.get(1),
+            4: found.get(2),
+            5: found.get(3),
+            6: found.get(4),
+        }
 
     out_dir = args.out if args.out is not None else toc_dir / "tex_extracted"
 
