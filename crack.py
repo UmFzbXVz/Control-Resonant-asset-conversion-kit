@@ -4,10 +4,7 @@ from pathlib import Path
 import struct
 import argparse
 import lz4.block
-import math
 import re
-
-from PIL import Image
 
 
 def u8(buf, off):
@@ -297,403 +294,23 @@ def extract_file_bytes(full, h, file_entry, blob_handles):
     return bytes(output), chunks
 
 
-# ----------------------------------------------------------------------
-# TEX → PNG CONVERSION
-# ----------------------------------------------------------------------
-
-def rgb565(c):
-    r = ((c >> 11) & 0x1F) * 255 // 31
-    g = ((c >> 5) & 0x3F) * 255 // 63
-    b = (c & 0x1F) * 255 // 31
-    return r, g, b
-
-
-def decode_bc1_block(data, offset):
-    """Decode one BC1/DXT1 8-byte block → 16 RGBA tuples."""
-    color0, color1, indices = struct.unpack_from("<HHI", data, offset)
-
-    c0 = rgb565(color0)
-    c1 = rgb565(color1)
-
-    colors = [None] * 4
-    colors[0] = (*c0, 255)
-    colors[1] = (*c1, 255)
-
-    if color0 > color1:
-        colors[2] = (
-            (2 * c0[0] + c1[0]) // 3,
-            (2 * c0[1] + c1[1]) // 3,
-            (2 * c0[2] + c1[2]) // 3,
-            255,
-        )
-        colors[3] = (
-            (c0[0] + 2 * c1[0]) // 3,
-            (c0[1] + 2 * c1[1]) // 3,
-            (c0[2] + 2 * c1[2]) // 3,
-            255,
-        )
-    else:
-        colors[2] = (
-            (c0[0] + c1[0]) // 2,
-            (c0[1] + c1[1]) // 2,
-            (c0[2] + c1[2]) // 2,
-            255,
-        )
-        colors[3] = (0, 0, 0, 0)
-
-    pixels = []
-    for i in range(16):
-        idx = (indices >> (2 * i)) & 3
-        pixels.append(colors[idx])
-    return pixels
-
-
-def decode_bc1(data, width, height):
-    output = bytearray(width * height * 4)
-    blocks_x = (width + 3) // 4
-    blocks_y = (height + 3) // 4
-    offset = 0
-
-    for by in range(blocks_y):
-        for bx in range(blocks_x):
-            if offset + 8 > len(data):
-                raise ValueError(f"Unexpected end of BC1 data at block ({bx}, {by})")
-            pixels = decode_bc1_block(data, offset)
-            offset += 8
-
-            for py in range(4):
-                for px in range(4):
-                    x = bx * 4 + px
-                    y = by * 4 + py
-                    if x >= width or y >= height:
-                        continue
-                    color = pixels[py * 4 + px]
-                    dst = (y * width + x) * 4
-                    output[dst:dst + 4] = bytes(color)
-
-    return bytes(output)
-
-
-def decode_alpha_block(data, offset):
-    """Decode BC3/BC4-style 8-byte alpha/endpoint block → 16 values 0-255."""
-    a0 = data[offset]
-    a1 = data[offset + 1]
-    bits = int.from_bytes(data[offset + 2:offset + 8], "little")
-
-    alphas = [0] * 8
-    alphas[0] = a0
-    alphas[1] = a1
-
-    if a0 > a1:
-        for i in range(1, 7):
-            alphas[i + 1] = ((7 - i) * a0 + i * a1) // 7
-    else:
-        for i in range(1, 5):
-            alphas[i + 1] = ((5 - i) * a0 + i * a1) // 5
-        alphas[6] = 0
-        alphas[7] = 255
-
-    values = []
-    for i in range(16):
-        idx = (bits >> (3 * i)) & 7
-        values.append(alphas[idx])
-    return values
-
-
-def decode_bc3(data, width, height):
-    """BC3 / DXT5 — 16 bytes per block (alpha + color)."""
-    output = bytearray(width * height * 4)
-    blocks_x = (width + 3) // 4
-    blocks_y = (height + 3) // 4
-    offset = 0
-
-    for by in range(blocks_y):
-        for bx in range(blocks_x):
-            if offset + 16 > len(data):
-                raise ValueError(f"Unexpected end of BC3 data at block ({bx}, {by})")
-
-            alphas = decode_alpha_block(data, offset)
-            offset += 8
-            colors = decode_bc1_block(data, offset)
-            offset += 8
-
-            for py in range(4):
-                for px in range(4):
-                    x = bx * 4 + px
-                    y = by * 4 + py
-                    if x >= width or y >= height:
-                        continue
-                    r, g, b, _ = colors[py * 4 + px]
-                    a = alphas[py * 4 + px]
-                    dst = (y * width + x) * 4
-                    output[dst:dst + 4] = bytes((r, g, b, a))
-
-    return bytes(output)
-
-
-def decode_bc4(data, width, height):
-    """BC4 — single channel, 8 bytes per block. Stored as grayscale RGBA."""
-    output = bytearray(width * height * 4)
-    blocks_x = (width + 3) // 4
-    blocks_y = (height + 3) // 4
-    offset = 0
-
-    for by in range(blocks_y):
-        for bx in range(blocks_x):
-            if offset + 8 > len(data):
-                raise ValueError(f"Unexpected end of BC4 data at block ({bx}, {by})")
-
-            values = decode_alpha_block(data, offset)
-            offset += 8
-
-            for py in range(4):
-                for px in range(4):
-                    x = bx * 4 + px
-                    y = by * 4 + py
-                    if x >= width or y >= height:
-                        continue
-                    v = values[py * 4 + px]
-                    dst = (y * width + x) * 4
-                    output[dst:dst + 4] = bytes((v, v, v, 255))
-
-    return bytes(output)
-
-
-def decode_bc5(data, width, height):
-    """BC5 — two channels (R+G), 16 bytes per block. Common for normal maps.
-    Reconstructs approximate B from R/G for visualization (RG → normal).
-    """
-    output = bytearray(width * height * 4)
-    blocks_x = (width + 3) // 4
-    blocks_y = (height + 3) // 4
-    offset = 0
-
-    for by in range(blocks_y):
-        for bx in range(blocks_x):
-            if offset + 16 > len(data):
-                raise ValueError(f"Unexpected end of BC5 data at block ({bx}, {by})")
-
-            reds = decode_alpha_block(data, offset)
-            offset += 8
-            greens = decode_alpha_block(data, offset)
-            offset += 8
-
-            for py in range(4):
-                for px in range(4):
-                    x = bx * 4 + px
-                    y = by * 4 + py
-                    if x >= width or y >= height:
-                        continue
-                    r = reds[py * 4 + px]
-                    g = greens[py * 4 + px]
-
-                    # Reconstruct approximate blue for normal-map visualization
-                    nx = (r / 255.0) * 2.0 - 1.0
-                    ny = (g / 255.0) * 2.0 - 1.0
-                    nz_sq = 1.0 - nx * nx - ny * ny
-                    nz = math.sqrt(nz_sq) if nz_sq > 0 else 0.0
-                    b = int(max(0, min(255, (nz * 0.5 + 0.5) * 255)))
-
-                    dst = (y * width + x) * 4
-                    output[dst:dst + 4] = bytes((r, g, b, 255))
-
-    return bytes(output)
-
-
-def half_to_float(h):
-    """Convert IEEE 754 half-precision to float."""
-    s = (h >> 15) & 1
-    e = (h >> 10) & 0x1F
-    m = h & 0x3FF
-
-    if e == 0:
-        if m == 0:
-            return -0.0 if s else 0.0
-        # subnormal
-        return ((-1) ** s) * (m / 1024.0) * (2 ** -14)
-    if e == 31:
-        if m == 0:
-            return float("-inf") if s else float("inf")
-        return float("nan")
-
-    return ((-1) ** s) * (1.0 + m / 1024.0) * (2 ** (e - 15))
-
-
-def decode_r16g16b16a16_float(data, width, height):
-    """R16G16B16A16_FLOAT — 8 bytes per pixel. Tone-map to 8-bit for PNG."""
-    expected = width * height * 8
-    if len(data) < expected:
-        raise ValueError(
-            f"Not enough R16G16B16A16_FLOAT data: need {expected}, have {len(data)}"
-        )
-
-    output = bytearray(width * height * 4)
-    offset = 0
-
-    for i in range(width * height):
-        r_h, g_h, b_h, a_h = struct.unpack_from("<4H", data, offset)
-        offset += 8
-
-        r = half_to_float(r_h)
-        g = half_to_float(g_h)
-        b = half_to_float(b_h)
-        a = half_to_float(a_h)
-
-        def to_u8(v):
-            if math.isnan(v) or math.isinf(v):
-                return 0
-            return int(max(0.0, min(255.0, v * 255.0)))
-
-        dst = i * 4
-        output[dst:dst + 4] = bytes((
-            to_u8(r),
-            to_u8(g),
-            to_u8(b),
-            to_u8(a),
-        ))
-
-    return bytes(output)
-
-
-def decode_bgra8(data, width, height):
-    """B8G8R8A8_UNORM / SRGB — 4 bytes per pixel, BGRA order."""
-    expected = width * height * 4
-    if len(data) < expected:
-        raise ValueError(
-            f"Not enough BGRA8 data: need {expected}, have {len(data)}"
-        )
-
-    output = bytearray(width * height * 4)
-    for i in range(width * height):
-        b, g, r, a = data[i * 4:i * 4 + 4]
-        dst = i * 4
-        output[dst:dst + 4] = bytes((r, g, b, a))
-
-    return bytes(output)
-
-
-def parse_dds(data):
-    """Parse DDS texture from bytes (no disk I/O)."""
-    if data[:4] != b"DDS ":
-        raise ValueError("File does not start with a DDS header")
-
-    header_size = struct.unpack_from("<I", data, 4)[0]
-    if header_size != 124:
-        raise ValueError(f"Unexpected DDS header size: {header_size}")
-
-    height = struct.unpack_from("<I", data, 12)[0]
-    width = struct.unpack_from("<I", data, 16)[0]
-
-    pf_size = struct.unpack_from("<I", data, 76)[0]
-    fourcc = data[84:88]
-
-    if pf_size != 32:
-        raise ValueError("Invalid DDS pixel format")
-
-    format_id = None
-    pixel_data_offset = 128
-    block_size = None
-    bytes_per_pixel = None
-
-    if fourcc == b"DX10":
-        dxgi_format = struct.unpack_from("<I", data, 128)[0]
-        format_id = dxgi_format
-        pixel_data_offset = 148
-
-        if dxgi_format in (71, 72):
-            block_size = 8
-        elif dxgi_format in (77, 78):
-            block_size = 16
-        elif dxgi_format in (80, 81):
-            block_size = 8
-        elif dxgi_format in (83, 84):
-            block_size = 16
-        elif dxgi_format == 10:
-            bytes_per_pixel = 8
-        elif dxgi_format in (87, 91):
-            bytes_per_pixel = 4
-        else:
-            raise NotImplementedError(
-                f"Unsupported DXGI format {dxgi_format}"
-            )
-
-    elif fourcc in (b"DXT1", b"BC1 "):
-        format_id = 71
-        block_size = 8
-        pixel_data_offset = 128
-
-    elif fourcc in (b"DXT3", b"BC2 "):
-        format_id = 74
-        block_size = 16
-        pixel_data_offset = 128
-        raise NotImplementedError("BC2/DXT3 not yet implemented")
-
-    elif fourcc in (b"DXT5", b"BC3 "):
-        format_id = 77
-        block_size = 16
-        pixel_data_offset = 128
-
-    elif fourcc in (b"BC4U", b"ATI1", b"BC4 "):
-        format_id = 80
-        block_size = 8
-        pixel_data_offset = 128
-
-    elif fourcc in (b"BC5U", b"ATI2", b"BC5 "):
-        format_id = 83
-        block_size = 16
-        pixel_data_offset = 128
-
-    else:
-        raise NotImplementedError(
-            f"Unsupported DDS format: {fourcc!r}"
-        )
-
-    if block_size is not None:
-        blocks_x = (width + 3) // 4
-        blocks_y = (height + 3) // 4
-        required = blocks_x * blocks_y * block_size
-    else:
-        required = width * height * bytes_per_pixel
-
-    available = len(data) - pixel_data_offset
-    if available < required:
-        raise ValueError(
-            f"Not enough texture data: need {required} bytes, have {available}"
-        )
-
-    texture_data = data[pixel_data_offset:pixel_data_offset + required]
-
-    return width, height, texture_data, format_id
-
-
-def tex_bytes_to_png(tex_data, output_file):
-    """Convert in-memory .tex (DDS) data to a PNG file on disk."""
-    width, height, texture_data, format_id = parse_dds(tex_data)
-
-    if format_id in (71, 72):
-        rgba = decode_bc1(texture_data, width, height)
-    elif format_id in (77, 78):
-        rgba = decode_bc3(texture_data, width, height)
-    elif format_id in (80, 81):
-        rgba = decode_bc4(texture_data, width, height)
-    elif format_id in (83, 84):
-        rgba = decode_bc5(texture_data, width, height)
-    elif format_id == 10:
-        rgba = decode_r16g16b16a16_float(texture_data, width, height)
-    elif format_id in (87, 91):
-        rgba = decode_bgra8(texture_data, width, height)
-    else:
-        raise NotImplementedError(f"No decoder for format {format_id}")
-
-    image = Image.frombytes("RGBA", (width, height), rgba)
-    image.save(output_file, "PNG")
-
-    return output_file
-
-
 def main():
     parser = argparse.ArgumentParser(
-        description="Extract .tex textures from Northlight .rmdtoc/.rmdblob and convert to PNG"
+        description="Extract selected file types from Northlight .rmdtoc/.rmdblob"
+    )
+
+    parser.add_argument(
+        "--filetype",
+        type=str,
+        default=None,
+        help="Comma-separated file types to extract, e.g. tex,wem,css",
+    )
+
+    parser.add_argument(
+        "--count",
+        type=int,
+        default=None,
+        help="Limit number of selected assets to extract (default: all)",
     )
 
     parser.add_argument(
@@ -702,65 +319,13 @@ def main():
         help="Path to .rmdtoc file",
     )
 
-    parser.add_argument(
-        "--out",
-        type=Path,
-        default=None,
-        help="Output directory (default: tex_extracted next to the toc)",
-    )
-
-    parser.add_argument(
-        "--count",
-        type=int,
-        default=None,
-        help="Limit number of .tex assets to extract (default: all)",
-    )
-
     args = parser.parse_args()
 
     toc_dir = args.toc.parent
-    name = args.toc.name.replace(".rmdtoc", "")
-
-    found = {}
-    for path in toc_dir.glob(f"{name}*.rmdblob"):
-        m = re.search(r"-(\d+)\.rmdblob$", path.name)
-        if m:
-            found[int(m.group(1))] = path
-
-    if name.lower().startswith("stream"):
-        BLOBS = {
-            0: found.get(0),
-            1: found.get(15),
-            2: found.get(1),
-            3: found.get(2),
-            4: found.get(3),
-            5: found.get(4),
-            6: found.get(5),
-            7: found.get(6),
-            8: found.get(7),
-            9: found.get(8),
-            10: found.get(9),
-            11: found.get(10),
-            12: found.get(11),
-            13: found.get(12),
-            14: found.get(13),
-            15: found.get(14),
-        }
-    else:
-        BLOBS = {
-            0: found.get(0),
-            1: found.get(5),
-            2: None,
-            3: found.get(1),
-            4: found.get(2),
-            5: found.get(3),
-            6: found.get(4),
-        }
-
-    out_dir = args.out if args.out is not None else toc_dir / "tex_extracted"
+    out_dir = args.toc.parent / "extracted"
 
     print("=" * 100)
-    print("CONTROL RESONANT ASSET CONVERSION KIT")
+    print("CONTROL RESONANT ASSET EXTRACTION KIT")
     print("=" * 100)
 
     print(f"TOC = {args.toc}")
@@ -769,25 +334,118 @@ def main():
     toc = args.toc.read_bytes()
 
     h = parse_header(toc)
-
     full = reconstruct_logical_toc(toc, h)
 
     print(f"logical TOC = {len(full):,} (0x{len(full):X})")
+
+    # ------------------------------------------------------------------
+    # Build BLOBS from archives table (handles ../pc/ and ../generic/)
+    # ------------------------------------------------------------------
+    BLOBS = {}
+    aoff = h["archives_off"]
+    acnt = h["archives_count"]
+    soff = h["strings_off"]
+
+    for i in range(acnt):
+        p = aoff + i * 0x18
+        name_off = u32(full, p)
+        name_len = u32(full, p + 4)
+        raw = full[soff + name_off : soff + name_off + name_len]
+        rel = raw.split(b"\0")[0].decode("utf-8", "replace")
+
+        candidate = (toc_dir / rel).resolve()
+        if not candidate.is_file():
+            candidate = toc_dir / Path(rel).name
+
+        if candidate.is_file():
+            BLOBS[i] = candidate
+            print(f"  archive {i} -> {candidate}  ({candidate.stat().st_size:,} bytes)")
+        else:
+            print(f"WARNING: archive {i} → {rel} not found")
 
     paths = parse_paths(full, h)
     print(f"paths = {len(paths):,}")
 
     files = parse_files(full, h, paths)
 
-    tex = [
-        f for f in files
-        if f["name"].lower().endswith(".tex")
+    # ------------------------------------------------------------------
+    # FILE TYPE INVENTORY
+    # ------------------------------------------------------------------
+    type_counts = {}
+
+    for f in files:
+        filename = f["name"]
+
+        if "." in filename:
+            file_type = "." + filename.rsplit(".", 1)[1].lower()
+        else:
+            file_type = "<no extension>"
+
+        type_counts[file_type] = type_counts.get(file_type, 0) + 1
+
+    print()
+    print("=" * 100)
+    print("AVAILABLE FILE TYPES")
+    print("=" * 100)
+
+    for file_type, count in sorted(
+        type_counts.items(),
+        key=lambda item: (-item[1], item[0]),
+    ):
+        print(f"{file_type:20s} {count:,}")
+
+    # ------------------------------------------------------------------
+    # SELECT FILE TYPES
+    # ------------------------------------------------------------------
+    selected_types = set()
+
+    if args.filetype:
+        for value in args.filetype.split(","):
+            value = value.strip().lower()
+
+            if not value:
+                continue
+
+            if value != "<no extension>" and not value.startswith("."):
+                value = "." + value
+
+            selected_types.add(value)
+
+    if not selected_types:
+        print()
+        print("No file type selected.")
+        print("Use --filetype to select one or more types, for example:")
+        print("  python3 script.py --filetype=tex base-generic.rmdtoc")
+        print("  python3 script.py --filetype=wem base-generic.rmdtoc")
+        print("  python3 script.py --filetype=tex,wem,css --count 10 base-generic.rmdtoc")
+        return
+
+    selected = [
+        f
+        for f in files
+        if (
+            (
+                "." + f["name"].rsplit(".", 1)[1].lower()
+            )
+            if "." in f["name"]
+            else "<no extension>"
+        ) in selected_types
     ]
 
-    print(f"files = {len(files):,}")
-    print(f"TEX assets = {len(tex):,}")
+    if args.count is not None:
+        if args.count < 0:
+            parser.error("--count must be >= 0")
+        selected = selected[:args.count]
 
-    selected = tex if args.count is None else tex[:args.count]
+    print()
+    print("=" * 100)
+    print("SELECTED FILE TYPES")
+    print("=" * 100)
+
+    for file_type in sorted(selected_types):
+        print(f"{file_type:20s} {type_counts.get(file_type, 0):,}")
+
+    print(f"selected = {len(selected):,}")
 
     needed_archives = set()
     for f in selected:
@@ -809,17 +467,15 @@ def main():
             print(f"WARNING: blob missing for archive {archive}: {path}")
             continue
 
-        print(f"archive {archive} -> {path.name}")
+        print(f"archive {archive} -> {path}")
         blob_handles[archive] = open(path, "rb")
 
     print()
     print("=" * 100)
-    print(f"EXTRACTING {len(selected)} TEX ASSETS")
+    print(f"EXTRACTING {len(selected)} ASSETS")
     print("=" * 100)
 
     ok = 0
-    converted = 0
-    convert_failed = 0
 
     try:
         for n, f in enumerate(selected):
@@ -828,7 +484,7 @@ def main():
             print(f"      size = 0x{f['total_size']:X} ({f['total_size']:,})")
 
             try:
-                tex_data, chunks = extract_file_bytes(
+                file_data, chunks = extract_file_bytes(
                     full, h, f, blob_handles
                 )
 
@@ -845,22 +501,17 @@ def main():
 
                 ok += 1
 
-                out_base = safe_output_path(out_dir, f["full_path"])
-                out_base.parent.mkdir(parents=True, exist_ok=True)
+                output_path = safe_output_path(
+                    out_dir,
+                    f["full_path"],
+                )
+                output_path.parent.mkdir(
+                    parents=True,
+                    exist_ok=True,
+                )
+                output_path.write_bytes(file_data)
 
-                png_path = out_base.with_suffix(".png")
-                tex_path = out_base  # already ends with .tex
-
-                try:
-                    tex_bytes_to_png(tex_data, png_path)
-                    print(f"      PNG  -> {png_path}")
-                    converted += 1
-                except Exception as conv_err:
-                    # Conversion failed — keep .tex as backup
-                    tex_path.write_bytes(tex_data)
-                    print(f"      CONVERT ERROR: {conv_err}")
-                    print(f"      TEX  -> {tex_path}  (backup)")
-                    convert_failed += 1
+                print(f"      FILE -> {output_path}")
 
             except Exception as e:
                 print(f"      ERROR: {e}")
@@ -876,8 +527,6 @@ def main():
     print(f"selected = {len(selected)}")
     print(f"extracted = {ok}")
     print(f"failed = {len(selected) - ok}")
-    print(f"converted to PNG = {converted}")
-    print(f"convert failed (kept .tex) = {convert_failed}")
 
     print()
     print("=" * 100)
