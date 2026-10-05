@@ -4,11 +4,13 @@ from pathlib import Path
 import struct
 import argparse
 import lz4.block
-import re
 
 
-def u8(buf, off):
-    return buf[off]
+DESCRIPTOR_SIZE = 0x10
+ARCHIVE_SIZE = 0x18
+PATH_SIZE = 0x1C
+FILE_SIZE = 0x20
+CHUNK_SIZE = 0x10
 
 
 def u32(buf, off):
@@ -47,24 +49,59 @@ def parse_header(toc):
     }
 
 
-def reconstruct_logical_toc(toc, h):
-    if h["table_size"] % 0x10:
-        raise RuntimeError("Descriptor table size is not divisible by 0x10")
+def check_table(full, h, name, off_key, count_key, record_size):
+    off = h[off_key]
+    count = h[count_key]
+    end = off + count * record_size
 
+    if end > len(full):
+        raise RuntimeError(
+            f"{name} table exceeds logical TOC: "
+            f"off=0x{off:X}, count=0x{count:X}, "
+            f"record_size=0x{record_size:X}, "
+            f"end=0x{end:X}, TOC=0x{len(full):X}"
+        )
+
+
+def reconstruct_logical_toc(toc, h):
+    table_size = h["table_size"]
+
+    if table_size % DESCRIPTOR_SIZE:
+        raise RuntimeError(
+            "Descriptor table size is not divisible by "
+            f"0x{DESCRIPTOR_SIZE:X}"
+        )
+
+    count = table_size // DESCRIPTOR_SIZE
     full = bytearray()
 
-    count = h["table_size"] // 0x10
-
     for i in range(count):
-        p = h["table_off"] + i * 0x10
+        p = h["table_off"] + i * DESCRIPTOR_SIZE
+
+        if p + DESCRIPTOR_SIZE > len(toc):
+            raise RuntimeError(
+                f"TOC descriptor {i} outside physical TOC: "
+                f"0x{p:X}"
+            )
 
         data_off = u40(toc, p + 0x03)
-        decomp   = u32(toc, p + 0x08)
-        comp     = u32(toc, p + 0x0C)
+        decomp = u32(toc, p + 0x08)
+        comp = u32(toc, p + 0x0C)
 
-        stored = comp if comp else decomp
+        stored_size = comp if comp else decomp
+        data_end = data_off + stored_size
 
-        raw = toc[data_off:data_off + stored]
+        if data_end > len(toc):
+            raise RuntimeError(
+                f"TOC descriptor {i}: "
+                f"data outside physical TOC: "
+                f"off=0x{data_off:X}, "
+                f"size=0x{stored_size:X}, "
+                f"end=0x{data_end:X}, "
+                f"TOC=0x{len(toc):X}"
+            )
+
+        raw = toc[data_off:data_end]
 
         if comp:
             raw = lz4.block.decompress(
@@ -83,6 +120,32 @@ def reconstruct_logical_toc(toc, h):
     return full
 
 
+def read_string(full, h, off, size):
+    start = h["strings_off"] + off
+    end = start + size
+    strings_end = h["strings_off"] + h["strings_size"]
+
+    if start < h["strings_off"] or end > strings_end:
+        raise RuntimeError(
+            f"String outside string table: "
+            f"off=0x{off:X}, size=0x{size:X}, "
+            f"string_table=0x{h['strings_off']:X}.."
+            f"0x{strings_end:X}"
+        )
+
+    if end > len(full):
+        raise RuntimeError(
+            f"String outside logical TOC: "
+            f"start=0x{start:X}, end=0x{end:X}, "
+            f"TOC=0x{len(full):X}"
+        )
+
+    return full[start:end].decode(
+        "utf-8",
+        errors="replace"
+    )
+
+
 def parse_paths(full, h):
     paths = {}
 
@@ -90,13 +153,17 @@ def parse_paths(full, h):
     count = h["paths_count"]
     strings = h["strings_off"]
 
-    record_size = 0x1C
-
-    if base + count * record_size > h["files_off"]:
-        raise RuntimeError("Path table exceeds files section")
+    check_table(
+        full,
+        h,
+        "Path",
+        "paths_off",
+        "paths_count",
+        PATH_SIZE,
+    )
 
     for i in range(count):
-        p = base + i * record_size
+        p = base + i * PATH_SIZE
 
         string_off = u32(full, p + 0x14)
         string_len = u32(full, p + 0x18)
@@ -106,19 +173,23 @@ def parse_paths(full, h):
             strings + string_off + string_len
         ]
 
-        paths[i] = raw.decode("utf-8", errors="replace")
+        # read_string() performs the authoritative bounds check.
+        paths[i] = raw.decode(
+            "utf-8",
+            errors="replace"
+        )
+
+        if (
+            strings + string_off < strings
+            or strings + string_off + string_len
+            > strings + h["strings_size"]
+        ):
+            raise RuntimeError(
+                f"Path {i} string outside string table: "
+                f"off=0x{string_off:X}, size=0x{string_len:X}"
+            )
 
     return paths
-
-
-def read_string(full, h, off, size):
-    start = h["strings_off"] + off
-    end = start + size
-
-    return full[start:end].decode(
-        "utf-8",
-        errors="replace"
-    )
 
 
 def parse_files(full, h, paths):
@@ -127,19 +198,26 @@ def parse_files(full, h, paths):
     base = h["files_off"]
     count = h["files_count"]
 
-    for i in range(count):
-        p = base + i * 0x20
+    check_table(
+        full,
+        h,
+        "File",
+        "files_off",
+        "files_count",
+        FILE_SIZE,
+    )
 
-        (
-            chunk_off,
-            chunk_size,
-            path_idx,
-            string_off,
-            string_size,
-            total_size,
-            metadata_off,
-            metadata_size,
-        ) = struct.unpack_from("<8I", full, p)
+    for i in range(count):
+        p = base + i * FILE_SIZE
+
+        chunk_off = u32(full, p + 0x00)
+        chunk_size = u32(full, p + 0x04)
+        path_idx = u32(full, p + 0x08)
+        string_off = u32(full, p + 0x0C)
+        string_size = u32(full, p + 0x10)
+        total_size = u32(full, p + 0x14)
+        metadata_off = u32(full, p + 0x18)
+        metadata_size = u32(full, p + 0x1C)
 
         name = read_string(
             full,
@@ -172,18 +250,21 @@ def parse_files(full, h, paths):
 def parse_chunk(full, h, logical_off):
     p = h["chunks_off"] + logical_off
 
-    if p + 0x10 > len(full):
+    if p + CHUNK_SIZE > len(full):
         raise RuntimeError(
             f"Chunk outside logical TOC: 0x{p:X}"
         )
 
-    flags = u8(full, p + 0x00)
-    archive = u8(full, p + 0x01)
+    flags = full[p + 0x00]
+    archive = full[p + 0x01]
+
+    # +0x02 is currently not interpreted.
     blob_off = u40(full, p + 0x03)
+
     decomp = u32(full, p + 0x08)
     comp = u32(full, p + 0x0C)
 
-    stored = comp if comp else decomp
+    stored_size = comp if comp else decomp
 
     return {
         "toc_off": p,
@@ -192,7 +273,7 @@ def parse_chunk(full, h, logical_off):
         "blob_off": blob_off,
         "decomp": decomp,
         "comp": comp,
-        "stored": stored,
+        "stored": stored_size,
     }
 
 
@@ -200,25 +281,33 @@ def get_file_chunks(full, h, file_entry):
     chunk_off = file_entry["chunk_off"]
     chunk_size = file_entry["chunk_size"]
 
-    if chunk_size % 0x10:
+    if chunk_size % CHUNK_SIZE:
         raise RuntimeError(
             f"File {file_entry['index']} has invalid "
             f"chunk_size 0x{chunk_size:X}"
         )
 
-    chunks = []
+    chunk_end = h["chunks_off"] + chunk_off + chunk_size
 
-    count = chunk_size // 0x10
+    if chunk_end > len(full):
+        raise RuntimeError(
+            f"File {file_entry['index']} chunk range outside "
+            f"logical TOC: "
+            f"off=0x{chunk_off:X}, "
+            f"size=0x{chunk_size:X}"
+        )
+
+    chunks = []
+    count = chunk_size // CHUNK_SIZE
 
     for i in range(count):
         c = parse_chunk(
             full,
             h,
-            chunk_off + i * 0x10
+            chunk_off + i * CHUNK_SIZE
         )
 
         c["index"] = i
-
         chunks.append(c)
 
     return chunks
@@ -339,6 +428,36 @@ def main():
     print(f"logical TOC = {len(full):,} (0x{len(full):X})")
 
     # ------------------------------------------------------------------
+    # Validate logical tables.
+    # ------------------------------------------------------------------
+    check_table(
+        full,
+        h,
+        "Archive",
+        "archives_off",
+        "archives_count",
+        ARCHIVE_SIZE,
+    )
+
+    check_table(
+        full,
+        h,
+        "Path",
+        "paths_off",
+        "paths_count",
+        PATH_SIZE,
+    )
+
+    check_table(
+        full,
+        h,
+        "File",
+        "files_off",
+        "files_count",
+        FILE_SIZE,
+    )
+
+    # ------------------------------------------------------------------
     # Build BLOBS from archives table (handles ../pc/ and ../generic/)
     # ------------------------------------------------------------------
     BLOBS = {}
@@ -347,21 +466,46 @@ def main():
     soff = h["strings_off"]
 
     for i in range(acnt):
-        p = aoff + i * 0x18
-        name_off = u32(full, p)
-        name_len = u32(full, p + 4)
-        raw = full[soff + name_off : soff + name_off + name_len]
-        rel = raw.split(b"\0")[0].decode("utf-8", "replace")
+        p = aoff + i * ARCHIVE_SIZE
+
+        name_off = u32(full, p + 0x00)
+        name_len = u32(full, p + 0x04)
+
+        raw = full[
+            soff + name_off:
+            soff + name_off + name_len
+        ]
+
+        if (
+            soff + name_off < soff
+            or soff + name_off + name_len
+            > soff + h["strings_size"]
+        ):
+            raise RuntimeError(
+                f"Archive {i} name outside string table: "
+                f"off=0x{name_off:X}, size=0x{name_len:X}"
+            )
+
+        rel = raw.split(b"\0")[0].decode(
+            "utf-8",
+            "replace"
+        )
 
         candidate = (toc_dir / rel).resolve()
+
         if not candidate.is_file():
             candidate = toc_dir / Path(rel).name
 
         if candidate.is_file():
             BLOBS[i] = candidate
-            print(f"  archive {i} -> {candidate}  ({candidate.stat().st_size:,} bytes)")
+            print(
+                f"  archive {i} -> {candidate}  "
+                f"({candidate.stat().st_size:,} bytes)"
+            )
         else:
-            print(f"WARNING: archive {i} → {rel} not found")
+            print(
+                f"WARNING: archive {i} → {rel} not found"
+            )
 
     paths = parse_paths(full, h)
     print(f"paths = {len(paths):,}")
@@ -381,7 +525,9 @@ def main():
         else:
             file_type = "<no extension>"
 
-        type_counts[file_type] = type_counts.get(file_type, 0) + 1
+        type_counts[file_type] = (
+            type_counts.get(file_type, 0) + 1
+        )
 
     print()
     print("=" * 100)
@@ -406,10 +552,18 @@ def main():
             if not value:
                 continue
 
-            if value != "<no extension>" and not value.startswith("."):
+            if value == "all":
+                selected_types.update(type_counts)
+                continue
+
+            if (
+                value != "<no extension>"
+                and not value.startswith(".")
+            ):
                 value = "." + value
 
             selected_types.add(value)
+
 
     if not selected_types:
         print()
@@ -417,7 +571,10 @@ def main():
         print("Use --filetype to select one or more types, for example:")
         print("  python3 script.py --filetype=tex base-generic.rmdtoc")
         print("  python3 script.py --filetype=wem base-generic.rmdtoc")
-        print("  python3 script.py --filetype=tex,wem,css --count 10 base-generic.rmdtoc")
+        print(
+            "  python3 script.py "
+            "--filetype=tex,wem,css --count 10 base-generic.rmdtoc"
+        )
         return
 
     selected = [
@@ -435,6 +592,7 @@ def main():
     if args.count is not None:
         if args.count < 0:
             parser.error("--count must be >= 0")
+
         selected = selected[:args.count]
 
     print()
@@ -443,13 +601,18 @@ def main():
     print("=" * 100)
 
     for file_type in sorted(selected_types):
-        print(f"{file_type:20s} {type_counts.get(file_type, 0):,}")
+        print(
+            f"{file_type:20s} "
+            f"{type_counts.get(file_type, 0):,}"
+        )
 
     print(f"selected = {len(selected):,}")
 
     needed_archives = set()
+
     for f in selected:
         chunks = get_file_chunks(full, h, f)
+
         for c in chunks:
             needed_archives.add(c["archive"])
 
@@ -460,11 +623,15 @@ def main():
         path = BLOBS.get(archive)
 
         if path is None:
-            print(f"WARNING: archive {archive} has no known blob")
+            print(
+                f"WARNING: archive {archive} has no known blob"
+            )
             continue
 
         if not path.exists():
-            print(f"WARNING: blob missing for archive {archive}: {path}")
+            print(
+                f"WARNING: blob missing for archive {archive}: {path}"
+            )
             continue
 
         print(f"archive {archive} -> {path}")
@@ -481,11 +648,17 @@ def main():
         for n, f in enumerate(selected):
             print()
             print(f"[{n:03d}] {f['full_path']}")
-            print(f"      size = 0x{f['total_size']:X} ({f['total_size']:,})")
+            print(
+                f"      size = 0x{f['total_size']:X} "
+                f"({f['total_size']:,})"
+            )
 
             try:
                 file_data, chunks = extract_file_bytes(
-                    full, h, f, blob_handles
+                    full,
+                    h,
+                    f,
+                    blob_handles
                 )
 
                 print(f"      chunks = {len(chunks)}")
@@ -505,13 +678,38 @@ def main():
                     out_dir,
                     f["full_path"],
                 )
+
                 output_path.parent.mkdir(
                     parents=True,
                     exist_ok=True,
                 )
+
                 output_path.write_bytes(file_data)
 
                 print(f"      FILE -> {output_path}")
+
+                # Added missing metadata extraction needed for further file decoding
+                meta_size = f["metadata_size"]
+                if meta_size:
+                    meta_base = h["metadata_off"]
+                    meta_start = meta_base + f["metadata_off"]
+                    meta_end = meta_start + meta_size
+
+                    if meta_start < meta_base or meta_end > meta_base + h["metadata_size"]:
+                        raise RuntimeError(
+                            f"{f['full_path']}: metadata range outside metadata table: "
+                            f"off=0x{f['metadata_off']:X}, size=0x{meta_size:X}"
+                        )
+
+                    if meta_end > len(full):
+                        raise RuntimeError(
+                            f"{f['full_path']}: metadata range outside logical TOC"
+                        )
+
+                    metadata = full[meta_start:meta_end]
+                    metadata_path = Path(str(output_path) + ".meta")
+                    metadata_path.write_bytes(metadata)
+                    print(f"      META -> {metadata_path} (0x{len(metadata):X} bytes)")
 
             except Exception as e:
                 print(f"      ERROR: {e}")
