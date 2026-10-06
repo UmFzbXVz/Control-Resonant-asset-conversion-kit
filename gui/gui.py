@@ -3447,7 +3447,7 @@ class ControlAssetBrowser(tk.Tk):
         if rel.suffix.lower() == ".tex":
             rel = rel.with_suffix(".png")
         elif rel.suffix.lower() == ".wem":
-            rel = rel.with_suffix(".mp3")
+            rel = rel.with_suffix(".wav") # was .mp3
         elif rel.suffix.lower() == ".bin" and data is not None and _is_string_table_binary(data):
             # String-table binaries are exported as their human-readable .txt form.
             rel = rel.with_suffix(".txt")
@@ -3473,20 +3473,19 @@ class ControlAssetBrowser(tk.Tk):
             vgmstream = self._find_vgmstream()
             if vgmstream is None:
                 raise RuntimeError("Portable vgmstream-cli was not found beside the GUI.")
-            ffmpeg = self._find_ffmpeg()
-            if ffmpeg is None:
-                raise RuntimeError("Portable ffmpeg was not found beside the GUI; it is required to create MP3 exports.")
             with tempfile.TemporaryDirectory(prefix="control_wem_export_") as td:
                 td = Path(td)
                 wem = td / entry["name"].split("/")[-1]
-                wav = td / "decoded.wav"
                 wem.write_bytes(data)
-                r = subprocess.run([str(vgmstream), "-o", str(wav), str(wem)], cwd=str(vgmstream.parent), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-                if r.returncode != 0 or not wav.is_file():
-                    raise RuntimeError((r.stderr or r.stdout or "vgmstream failed").strip())
-                r = subprocess.run([str(ffmpeg), "-y", "-loglevel", "error", "-i", str(wav), "-codec:a", "libmp3lame", "-q:a", "2", str(output_path)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                r = subprocess.run(
+                    [str(vgmstream), "-o", str(output_path), str(wem)],
+                    cwd=str(vgmstream.parent),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
                 if r.returncode != 0 or not output_path.is_file():
-                    raise RuntimeError((r.stderr or r.stdout or "ffmpeg failed to encode MP3").strip())
+                    raise RuntimeError((r.stderr or r.stdout or "vgmstream failed").strip())
             return True
         return False
 
