@@ -1,736 +1,1072 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 
-from pathlib import Path
-import struct
 import argparse
+import struct
+import sys
+import os
+import tempfile
+import zlib
+from dataclasses import dataclass, field
+from pathlib import Path
+
 import lz4.block
 
 
-DESCRIPTOR_SIZE = 0x10
-ARCHIVE_SIZE = 0x18
-PATH_SIZE = 0x1C
-FILE_SIZE = 0x20
-CHUNK_SIZE = 0x10
+DESCRIPTOR = 0x10
+ARCHIVE = 0x18
+PATH = 0x1C
+FILE = 0x20
+CHUNK = 0x10
+
+MAGIC = b"COTR"
+SUPPORTED_VERSION = 3
 
 
-def u32(buf, off):
-    return struct.unpack_from("<I", buf, off)[0]
+class SemanticError(Exception):
+    pass
 
 
-def u40(buf, off):
-    return int.from_bytes(buf[off:off + 5], "little")
+@dataclass
+class CheckStats:
+    total: int = 0
+    passed: int = 0
+    failed: int = 0
+    groups: dict[str, dict[str, int]] = field(default_factory=dict)
+    current_group: str = "Unclassified"
+
+    def set_group(self, name: str):
+        self.current_group = name
+        self.groups.setdefault(name, {"total": 0, "passed": 0, "failed": 0})
+
+    def ok(self, condition: bool, message: str = ""):
+        group = self.groups.setdefault(
+            self.current_group, {"total": 0, "passed": 0, "failed": 0}
+        )
+        self.total += 1
+        group["total"] += 1
+        if condition:
+            self.passed += 1
+            group["passed"] += 1
+            return
+        self.failed += 1
+        group["failed"] += 1
+        raise SemanticError(message or "semantic check failed")
 
 
-def parse_header(toc):
-    return {
-        "table_off":      u32(toc, 0x08),
-        "table_size":     u32(toc, 0x0C),
-
-        "archives_off":   u32(toc, 0x10),
-        "archives_count": u32(toc, 0x14),
-
-        "paths_off":      u32(toc, 0x18),
-        "paths_count":    u32(toc, 0x1C),
-
-        "files_off":      u32(toc, 0x20),
-        "files_count":    u32(toc, 0x24),
-
-        "strings_off":    u32(toc, 0x28),
-        "strings_size":   u32(toc, 0x2C),
-
-        "paths2_off":     u32(toc, 0x30),
-        "paths2_count":   u32(toc, 0x34),
-
-        "metadata_off":   u32(toc, 0x38),
-        "metadata_size":  u32(toc, 0x3C),
-
-        "chunks_off":     u32(toc, 0x50),
-        "chunks_size":    u32(toc, 0x54),
-    }
+def u32(b, p):
+    return struct.unpack_from("<I", b, p)[0]
 
 
-def check_table(full, h, name, off_key, count_key, record_size):
-    off = h[off_key]
-    count = h[count_key]
-    end = off + count * record_size
+def u64(b, p):
+    return struct.unpack_from("<Q", b, p)[0]
 
-    if end > len(full):
-        raise RuntimeError(
-            f"{name} table exceeds logical TOC: "
-            f"off=0x{off:X}, count=0x{count:X}, "
-            f"record_size=0x{record_size:X}, "
-            f"end=0x{end:X}, TOC=0x{len(full):X}"
+
+def u40(b, p):
+    return int.from_bytes(b[p:p + 5], "little")
+
+
+def span(b, p, n):
+    if not (0 <= p <= len(b) and 0 <= n <= len(b) - p):
+        raise SemanticError(f"out-of-range span: 0x{p:x}+0x{n:x}")
+    return b[p:p + n]
+
+
+def table(b, off, count, size):
+    if off > len(b):
+        raise SemanticError(f"table offset outside logical TOC: 0x{off:x}")
+    end = off + count * size
+    if end > len(b):
+        raise SemanticError(
+            f"table exceeds logical TOC: 0x{off:x}+0x{count * size:x}"
+        )
+    return end
+
+
+def string(logical, strings_off, strings_size, off, size):
+    if off > strings_size or size > strings_size - off:
+        raise SemanticError(
+            f"string range outside pool: off=0x{off:x} size=0x{size:x}"
+        )
+    raw = span(logical, strings_off + off, size)
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise SemanticError(f"invalid UTF-8 in string pool: {e}") from e
+
+
+def _merge(ranges):
+    out = []
+    for a, b in sorted(ranges):
+        if not (0 <= a <= b):
+            raise SemanticError(f"invalid range 0x{a:x}..0x{b:x}")
+        if out and a <= out[-1][1]:
+            out[-1] = (out[-1][0], max(out[-1][1], b))
+        else:
+            out.append((a, b))
+    return out
+
+
+def _assert_partition(intervals, begin, end, label):
+    """Require sorted half-open intervals to partition [begin,end)."""
+    pos = begin
+    for a, b, what in sorted(intervals):
+        if a != pos:
+            raise SemanticError(
+                f"{label} has gap/overlap before {what}: "
+                f"expected 0x{pos:x}, got 0x{a:x}"
+            )
+        if b < a or b > end:
+            raise SemanticError(
+                f"{label} range outside [0x{begin:x},0x{end:x}): "
+                f"{what}=0x{a:x}..0x{b:x}"
+            )
+        pos = b
+    if pos != end:
+        raise SemanticError(
+            f"{label} does not cover through 0x{end:x}; stopped at 0x{pos:x}"
         )
 
 
-def reconstruct_logical_toc(toc, h):
-    table_size = h["table_size"]
+def decode_toc(path: Path):
+    toc = path.read_bytes()
+    stats = CheckStats()
 
-    if table_size % DESCRIPTOR_SIZE:
-        raise RuntimeError(
-            "Descriptor table size is not divisible by "
-            f"0x{DESCRIPTOR_SIZE:X}"
+    stats.set_group("COTR header")
+    stats.ok(len(toc) >= 0x58, "TOC shorter than 0x58-byte header")
+    stats.ok(toc[0:4] == MAGIC, f"bad magic: {toc[0:4]!r}")
+
+    version = u32(toc, 0x04)
+    stats.ok(
+        version == SUPPORTED_VERSION,
+        f"unsupported COTR version {version}",
+    )
+
+    descriptor_off = u32(toc, 0x08)
+    descriptor_size = u32(toc, 0x0C)
+    logical_archive_off = u32(toc, 0x10)
+    archive_count = u32(toc, 0x14)
+    path_off = u32(toc, 0x18)
+    path_count = u32(toc, 0x1C)
+    file_off = u32(toc, 0x20)
+    file_count = u32(toc, 0x24)
+    strings_off = u32(toc, 0x28)
+    strings_size = u32(toc, 0x2C)
+    metadata_type_off = u32(toc, 0x30)
+    metadata_type_count = u32(toc, 0x34)
+    metadata_off = u32(toc, 0x38)
+    metadata_size = u32(toc, 0x3C)
+    chunk_off = u32(toc, 0x50)
+    chunk_size = u32(toc, 0x54)
+
+    stats.ok(descriptor_off == 0x58, "descriptor table does not start at 0x58")
+    stats.ok(descriptor_size % DESCRIPTOR == 0, "descriptor size is not 0x10-aligned")
+    stats.ok(descriptor_off + descriptor_size <= len(toc), "descriptor table exceeds physical TOC")
+    stats.ok(logical_archive_off == 0, "logical archive table does not start at 0")
+    stats.ok(
+        all(x == 0 for x in toc[0x40:0x50]),
+        "header reserved bytes 0x40..0x4f are not zero",
+    )
+
+    descriptors = descriptor_size // DESCRIPTOR
+    logical = bytearray()
+    descriptor_info = []
+
+    stats.set_group("Descriptor reconstruction")
+    physical_payload_ranges = []
+    for i in range(descriptors):
+        p = descriptor_off + i * DESCRIPTOR
+        misc = span(toc, p, 3)
+        data_off = u40(toc, p + 3)
+        decomp = u32(toc, p + 8)
+        comp = u32(toc, p + 0xC)
+        stored = comp or decomp
+
+        stats.ok(
+            data_off >= descriptor_off + descriptor_size,
+            f"descriptor {i}: payload starts inside descriptor table",
+        )
+        stats.ok(
+            data_off + stored <= len(toc),
+            f"descriptor {i}: physical payload exceeds TOC",
         )
 
-    count = table_size // DESCRIPTOR_SIZE
-    full = bytearray()
+        stats.ok(
+            misc == b"\x10\x00\x00",
+            f"descriptor {i}: unexpected 3-byte format field {misc.hex()}",
+        )
 
-    for i in range(count):
-        p = h["table_off"] + i * DESCRIPTOR_SIZE
-
-        if p + DESCRIPTOR_SIZE > len(toc):
-            raise RuntimeError(
-                f"TOC descriptor {i} outside physical TOC: "
-                f"0x{p:X}"
-            )
-
-        data_off = u40(toc, p + 0x03)
-        decomp = u32(toc, p + 0x08)
-        comp = u32(toc, p + 0x0C)
-
-        stored_size = comp if comp else decomp
-        data_end = data_off + stored_size
-
-        if data_end > len(toc):
-            raise RuntimeError(
-                f"TOC descriptor {i}: "
-                f"data outside physical TOC: "
-                f"off=0x{data_off:X}, "
-                f"size=0x{stored_size:X}, "
-                f"end=0x{data_end:X}, "
-                f"TOC=0x{len(toc):X}"
-            )
-
-        raw = toc[data_off:data_end]
-
+        raw = span(toc, data_off, stored)
         if comp:
-            raw = lz4.block.decompress(
-                raw,
-                uncompressed_size=decomp
-            )
+            raw = lz4.block.decompress(raw, uncompressed_size=decomp)
 
-        if len(raw) != decomp:
-            raise RuntimeError(
-                f"TOC descriptor {i}: "
-                f"expected 0x{decomp:X}, got 0x{len(raw):X}"
-            )
-
-        full += raw
-
-    return full
-
-
-def read_string(full, h, off, size):
-    start = h["strings_off"] + off
-    end = start + size
-    strings_end = h["strings_off"] + h["strings_size"]
-
-    if start < h["strings_off"] or end > strings_end:
-        raise RuntimeError(
-            f"String outside string table: "
-            f"off=0x{off:X}, size=0x{size:X}, "
-            f"string_table=0x{h['strings_off']:X}.."
-            f"0x{strings_end:X}"
+        stats.ok(
+            len(raw) == decomp,
+            f"descriptor {i}: decompressed size mismatch",
         )
 
-    if end > len(full):
-        raise RuntimeError(
-            f"String outside logical TOC: "
-            f"start=0x{start:X}, end=0x{end:X}, "
-            f"TOC=0x{len(full):X}"
+        logical += raw
+        physical_payload_ranges.append((data_off, data_off + stored))
+        descriptor_info.append(
+            {
+                "misc": misc,
+                "data_off": data_off,
+                "decomp": decomp,
+                "comp": comp,
+                "stored": stored,
+            }
         )
 
-    return full[start:end].decode(
-        "utf-8",
-        errors="replace"
+    # Descriptor payloads are independent physical regions.
+    sorted_payloads = sorted(
+        (a, b, i) for i, (a, b) in enumerate(physical_payload_ranges)
+    )
+    for left, right in zip(sorted_payloads, sorted_payloads[1:]):
+        stats.ok(
+            left[1] <= right[0],
+            f"descriptor payloads overlap: {left[2]} and {right[2]}",
+        )
+
+    logical = bytes(logical)
+
+    stats.set_group("Logical section layout")
+    archive_end = table(logical, 0, archive_count, ARCHIVE)
+    path_end = table(logical, path_off, path_count, PATH)
+    file_end = table(logical, file_off, file_count, FILE)
+    stats.ok(chunk_size % CHUNK == 0, "chunk_size is not 0x10-aligned")
+    chunk_count = chunk_size // CHUNK
+    chunk_end = table(logical, chunk_off, chunk_count, CHUNK)
+
+    stats.ok(strings_off + strings_size <= len(logical), "string pool exceeds logical TOC")
+    stats.ok(
+        metadata_type_off + metadata_type_count * 8 <= len(logical),
+        "metadata-type table exceeds logical TOC",
+    )
+    stats.ok(
+        metadata_off + metadata_size <= len(logical),
+        "metadata pool exceeds logical TOC",
     )
 
-
-def parse_paths(full, h):
-    paths = {}
-
-    base = h["paths_off"]
-    count = h["paths_count"]
-    strings = h["strings_off"]
-
-    check_table(
-        full,
-        h,
-        "Path",
-        "paths_off",
-        "paths_count",
-        PATH_SIZE,
-    )
-
-    for i in range(count):
-        p = base + i * PATH_SIZE
-
-        string_off = u32(full, p + 0x14)
-        string_len = u32(full, p + 0x18)
-
-        raw = full[
-            strings + string_off:
-            strings + string_off + string_len
-        ]
-
-        # read_string() performs the authoritative bounds check.
-        paths[i] = raw.decode(
-            "utf-8",
-            errors="replace"
+    # The logical sections form one ordered TOC layout, with only zero padding
+    # allowed between sections. 
+    sections = [
+        ("archive", 0, archive_end),
+        ("path", path_off, path_end),
+        ("file", file_off, file_end),
+        ("strings", strings_off, strings_off + strings_size),
+        ("metadata_type", metadata_type_off,
+         metadata_type_off + metadata_type_count * 8),
+        ("metadata", metadata_off, metadata_off + metadata_size),
+        ("chunk", chunk_off, chunk_end),
+    ]
+    for (n1, a1, b1), (n2, a2, b2) in zip(sections, sections[1:]):
+        stats.ok(
+            b1 <= a2,
+            f"logical sections overlap: {n1} and {n2}",
         )
-
-        if (
-            strings + string_off < strings
-            or strings + string_off + string_len
-            > strings + h["strings_size"]
-        ):
-            raise RuntimeError(
-                f"Path {i} string outside string table: "
-                f"off=0x{string_off:X}, size=0x{string_len:X}"
+        if b1 < a2:
+            gap = logical[b1:a2]
+            stats.ok(
+                not any(gap),
+                f"non-zero logical alignment padding between {n1} and {n2}",
             )
 
-    return paths
+    stats.ok(
+        chunk_end == len(logical),
+        f"chunk table does not terminate logical TOC: 0x{chunk_end:x} != 0x{len(logical):x}",
+    )
 
+    stats.set_group("Archive records")
+    archives = []
+    for i in range(archive_count):
+        p = i * ARCHIVE
+        name_off = u32(logical, p)
+        name_size = u32(logical, p + 4)
+        name = string(logical, strings_off, strings_size, name_off, name_size)
+        identity = span(logical, p + 8, 8)
+        blob_size = u64(logical, p + 0x10)
 
-def parse_files(full, h, paths):
+        stats.ok(blob_size >= 16, f"archive {i}: impossible BLOB size {blob_size}")
+        archives.append((name, identity, blob_size))
+
+    stats.set_group("Path records and tree")
+    paths = []
+    for i in range(path_count):
+        p = path_off + i * PATH
+        parent = u32(logical, p)
+        first_child = u32(logical, p + 4)
+        child_count = u32(logical, p + 8)
+        first_file = u32(logical, p + 0xC)
+        file_count_i = u32(logical, p + 0x10)
+        name_off = u32(logical, p + 0x14)
+        name_size = u32(logical, p + 0x18)
+        name = string(logical, strings_off, strings_size, name_off, name_size)
+
+        stats.ok(
+            parent == 0xFFFFFFFF or parent < path_count,
+            f"path {i}: invalid parent {parent}",
+        )
+        stats.ok(
+            first_child + child_count <= path_count,
+            f"path {i}: child range exceeds path table",
+        )
+        stats.ok(
+            first_file + file_count_i <= file_count,
+            f"path {i}: file range exceeds file table",
+        )
+        paths.append(
+            (
+                parent,
+                first_child,
+                child_count,
+                first_file,
+                file_count_i,
+                name,
+            )
+        )
+
+    # Exactly one root; all child ranges agree with parent links.
+    roots = [i for i, p in enumerate(paths) if p[0] == 0xFFFFFFFF or p[0] == i]
+    stats.ok(len(roots) == 1, f"expected one root path, found {len(roots)}")
+
+    child_seen = [0] * path_count
+    for i, p in enumerate(paths):
+        first_child, child_count = p[1], p[2]
+        for child in range(first_child, first_child + child_count):
+            child_seen[child] += 1
+            stats.ok(
+                paths[child][0] == i,
+                f"path {child}: parent field disagrees with child range of {i}",
+            )
+
+    for i, p in enumerate(paths):
+        if i == roots[0]:
+            continue
+        stats.ok(
+            child_seen[i] == 1,
+            f"path {i}: expected exactly one parent range, got {child_seen[i]}",
+        )
+
+    stats.set_group("File records")
     files = []
+    for i in range(file_count):
+        p = file_off + i * FILE
+        chunk_rel = u32(logical, p)
+        chunk_bytes = u32(logical, p + 4)
+        path_index = u32(logical, p + 8)
+        name_off = u32(logical, p + 0xC)
+        name_size = u32(logical, p + 0x10)
+        total_size = u32(logical, p + 0x14)
+        meta_rel = u32(logical, p + 0x18)
+        meta_size = u32(logical, p + 0x1C)
 
-    base = h["files_off"]
-    count = h["files_count"]
+        stats.ok(path_index < path_count, f"file {i}: invalid path index")
+        stats.ok(chunk_bytes % CHUNK == 0, f"file {i}: chunk byte count not 0x10-aligned")
+        stats.ok(
+            chunk_rel + chunk_bytes <= chunk_size,
+            f"file {i}: chunk range exceeds chunk table",
+        )
+        stats.ok(
+            meta_rel <= metadata_size and meta_size <= metadata_size - meta_rel,
+            f"file {i}: metadata range exceeds metadata pool",
+        )
 
-    check_table(
-        full,
-        h,
-        "File",
-        "files_off",
-        "files_count",
-        FILE_SIZE,
+        name = string(logical, strings_off, strings_size, name_off, name_size)
+        path_name = paths[path_index][5]
+        full_name = f"{path_name}/{name}" if path_name else name
+
+        files.append(
+            {
+                "index": i,
+                "path_index": path_index,
+                "path": path_name,
+                "name": name,
+                "full_name": full_name,
+                "chunk_rel": chunk_rel,
+                "chunk_bytes": chunk_bytes,
+                "total_size": total_size,
+                "meta_rel": meta_rel,
+                "meta_size": meta_size,
+            }
+        )
+
+    stats.set_group("Chunk-range partition")
+    # File chunk ranges must partition the entire chunk table.
+    chunk_ranges = []
+    for f in files:
+        chunk_ranges.append(
+            (
+                f["chunk_rel"],
+                f["chunk_rel"] + f["chunk_bytes"],
+                f"file {f['index']}",
+            )
+        )
+    _assert_partition(chunk_ranges, 0, chunk_size, "file chunk ranges")
+    stats.ok(True, "file chunk ranges partition the entire chunk table")
+
+    stats.set_group("Path-range partition")
+    # Path file ranges must partition the entire file table.
+    file_ranges = [
+        (
+            p[3],
+            p[3] + p[4],
+            f"path {i}",
+        )
+        for i, p in enumerate(paths)
+        if p[4]
+    ]
+    _assert_partition(file_ranges, 0, file_count, "path file ranges")
+    stats.ok(True, "path file ranges partition the entire file table")
+
+    stats.set_group("Path/file cross-reference")
+    # Cross-check that every file record agrees with the path range that owns it.
+    # This is still TOC-local validation: no BLOB reads or extraction required.
+    for path_index, p in enumerate(paths):
+        first_file, file_count_i = p[3], p[4]
+        for file_index in range(first_file, first_file + file_count_i):
+            stats.ok(
+                files[file_index]["path_index"] == path_index,
+                f"file {file_index}: path index {files[file_index]['path_index']} "
+                f"disagrees with containing path {path_index}",
+            )
+
+    stats.set_group("Metadata-type table")
+    # Metadata type entries: offsets are relative to metadata_type_off.
+    # They address serialized type descriptions in logical TOC space.
+    metadata_types = []
+    for i in range(metadata_type_count):
+        p = metadata_type_off + i * 8
+        rel_off = u32(logical, p)
+        size = u32(logical, p + 4)
+        absolute = metadata_type_off + rel_off
+        stats.ok(
+            absolute + size <= len(logical),
+            f"metadata type {i}: type-description range exceeds logical TOC",
+        )
+        stats.ok(size > 0, f"metadata type {i}: zero-sized type description")
+        metadata_types.append((absolute, size))
+
+    stats.set_group("DMKP metadata records")
+    # Metadata instances: every metadata-bearing file has exactly one DMKP
+    # record occupying its complete metadata range.
+    metadata_magic_count = 0
+    metadata_versions = {}
+    for f in files:
+        if not f["meta_size"]:
+            continue
+
+        metadata_magic_count += 1
+        start = metadata_off + f["meta_rel"]
+        raw = span(logical, start, f["meta_size"])
+
+        stats.ok(
+            raw[:4] == b"DMKP",
+            f"file {f['index']} ({f['full_name']}): metadata is not DMKP",
+        )
+
+        version = u32(raw, 4)
+        stats.ok(
+            version in (3, 4),
+            f"file {f['index']} ({f['full_name']}): unsupported DMKP version {version}",
+        )
+        metadata_versions[version] = metadata_versions.get(version, 0) + 1
+
+    stats.set_group("Chunk semantics and file-size")
+    # Chunk semantics and file-size invariant.
+    chunk_count_by_file = 0
+    compressed_chunks = 0
+    stored_chunks = 0
+    total_decomp = 0
+    for f in files:
+        base = chunk_off + f["chunk_rel"]
+        count = f["chunk_bytes"] // CHUNK
+        chunk_count_by_file += count
+
+        file_sum = 0
+        for j in range(count):
+            p = base + j * CHUNK
+            flags = logical[p]
+            archive = logical[p + 1]
+            reserved = logical[p + 2]
+            blob_off = u40(logical, p + 3)
+            decomp = u32(logical, p + 8)
+            comp = u32(logical, p + 0xC)
+
+            stats.ok(
+                reserved == 0,
+                f"file {f['index']}: chunk {j} reserved byte is non-zero",
+            )
+            stats.ok(
+                archive < archive_count,
+                f"file {f['index']}: chunk {j} archive index out of range",
+            )
+            stats.ok(
+                (flags == 0x10) == (comp != 0),
+                f"file {f['index']}: chunk {j} compression flag mismatch",
+            )
+
+            file_sum += decomp
+            total_decomp += decomp
+            if comp:
+                compressed_chunks += 1
+            else:
+                stored_chunks += 1
+
+            # The 40-bit offset is unsigned by construction; 
+            _ = blob_off
+
+        stats.ok(
+            file_sum == f["total_size"],
+            f"file {f['index']}: chunk decomp sum != total_size",
+        )
+
+    stats.ok(
+        chunk_count_by_file == chunk_count,
+        "file chunk ranges do not account for every chunk record",
     )
-
-    for i in range(count):
-        p = base + i * FILE_SIZE
-
-        chunk_off = u32(full, p + 0x00)
-        chunk_size = u32(full, p + 0x04)
-        path_idx = u32(full, p + 0x08)
-        string_off = u32(full, p + 0x0C)
-        string_size = u32(full, p + 0x10)
-        total_size = u32(full, p + 0x14)
-        metadata_off = u32(full, p + 0x18)
-        metadata_size = u32(full, p + 0x1C)
-
-        name = read_string(
-            full,
-            h,
-            string_off,
-            string_size
-        )
-
-        path = paths.get(
-            path_idx,
-            f"<path_{path_idx}>"
-        )
-
-        files.append({
-            "index": i,
-            "path_idx": path_idx,
-            "path": path,
-            "name": name,
-            "full_path": f"{path}/{name}",
-            "chunk_off": chunk_off,
-            "chunk_size": chunk_size,
-            "total_size": total_size,
-            "metadata_off": metadata_off,
-            "metadata_size": metadata_size,
-        })
-
-    return files
-
-
-def parse_chunk(full, h, logical_off):
-    p = h["chunks_off"] + logical_off
-
-    if p + CHUNK_SIZE > len(full):
-        raise RuntimeError(
-            f"Chunk outside logical TOC: 0x{p:X}"
-        )
-
-    flags = full[p + 0x00]
-    archive = full[p + 0x01]
-
-    # +0x02 is currently not interpreted.
-    blob_off = u40(full, p + 0x03)
-
-    decomp = u32(full, p + 0x08)
-    comp = u32(full, p + 0x0C)
-
-    stored_size = comp if comp else decomp
 
     return {
-        "toc_off": p,
-        "flags": flags,
-        "archive": archive,
-        "blob_off": blob_off,
-        "decomp": decomp,
-        "comp": comp,
-        "stored": stored_size,
+        "path": path,
+        "toc": toc,
+        "logical": logical,
+        "archives": archives,
+        "paths": paths,
+        "files": files,
+        "chunk_off": chunk_off,
+        "chunk_size": chunk_size,
+        "metadata_off": metadata_off,
+        "metadata_size": metadata_size,
+        "metadata_type_off": metadata_type_off,
+        "metadata_type_count": metadata_type_count,
+        "metadata_types": metadata_types,
+        "physical_descriptor_count": descriptors,
+        "physical_misc": [x["misc"] for x in descriptor_info],
+        "descriptor_info": descriptor_info,
+        "semantic_checks": stats,
+        "semantic_groups": stats.groups,
+        "metadata_magic_count": metadata_magic_count,
+        "metadata_versions": metadata_versions,
+        "compressed_chunks": compressed_chunks,
+        "stored_chunks": stored_chunks,
+        "chunk_count": chunk_count,
+        "total_decomp": total_decomp,
     }
 
 
-def get_file_chunks(full, h, file_entry):
-    chunk_off = file_entry["chunk_off"]
-    chunk_size = file_entry["chunk_size"]
-
-    if chunk_size % CHUNK_SIZE:
-        raise RuntimeError(
-            f"File {file_entry['index']} has invalid "
-            f"chunk_size 0x{chunk_size:X}"
-        )
-
-    chunk_end = h["chunks_off"] + chunk_off + chunk_size
-
-    if chunk_end > len(full):
-        raise RuntimeError(
-            f"File {file_entry['index']} chunk range outside "
-            f"logical TOC: "
-            f"off=0x{chunk_off:X}, "
-            f"size=0x{chunk_size:X}"
-        )
-
-    chunks = []
-    count = chunk_size // CHUNK_SIZE
-
-    for i in range(count):
-        c = parse_chunk(
-            full,
-            h,
-            chunk_off + i * CHUNK_SIZE
-        )
-
-        c["index"] = i
-        chunks.append(c)
-
-    return chunks
+def extension(name):
+    return ("." + name.rsplit(".", 1)[1].lower()) if "." in name else "<no extension>"
 
 
-def extract_chunk(blob_fh, chunk):
-    """Read only the needed range from an open blob file handle."""
-    start = chunk["blob_off"]
-    size = chunk["stored"]
-
-    blob_fh.seek(start)
-    raw = blob_fh.read(size)
-
-    if len(raw) != size:
-        raise RuntimeError(
-            f"Chunk short read: wanted 0x{size:X}, got 0x{len(raw):X} "
-            f"at blob offset 0x{start:X}"
-        )
-
-    if chunk["comp"]:
-        raw = lz4.block.decompress(
-            raw,
-            uncompressed_size=chunk["decomp"]
-        )
-
-    if len(raw) != chunk["decomp"]:
-        raise RuntimeError(
-            f"Chunk decompression mismatch: "
-            f"expected 0x{chunk['decomp']:X}, "
-            f"got 0x{len(raw):X}"
-        )
-
-    return raw
+def discover(root):
+    if root.is_file():
+        if root.suffix.lower() != ".rmdtoc":
+            raise ValueError(f"not an .rmdtoc file: {root}")
+        return [root]
+    if not root.is_dir():
+        raise ValueError(f"not a file or directory: {root}")
+    return sorted(root.rglob("*.rmdtoc"))
 
 
-def safe_output_path(root, asset_path):
-    parts = []
-
-    for part in Path(asset_path).parts:
-        if part in ("", ".", ".."):
-            continue
-        parts.append(part)
-
-    return root.joinpath(*parts)
+def locate_blob(toc_path: Path, archive_name: str) -> Path | None:
+    candidate = (toc_path.parent / archive_name).resolve()
+    return candidate if candidate.is_file() else None
 
 
-def extract_file_bytes(full, h, file_entry, blob_handles):
-    """Assemble file data in memory from open blob handles. Does not write to disk."""
-    chunks = get_file_chunks(full, h, file_entry)
-    output = bytearray()
+def resolve_blobs(model):
+    handles = {}
 
-    for chunk in chunks:
-        archive = chunk["archive"]
-        blob_fh = blob_handles.get(archive)
-
-        if blob_fh is None:
-            raise RuntimeError(
-                f"Archive {archive} has no known blob"
+    for i, (rel, identity, expected_size) in enumerate(model["archives"]):
+        blob = locate_blob(model["path"], rel)
+        if blob is None:
+            raise SemanticError(f"archive {i}: missing blob {rel}")
+        if blob.stat().st_size != expected_size:
+            raise SemanticError(
+                f"archive {i}: BLOB size {blob.stat().st_size} != {expected_size}"
             )
 
-        output += extract_chunk(blob_fh, chunk)
+        with blob.open("rb") as f:
+            header = f.read(16)
+        if len(header) != 16:
+            raise SemanticError(f"archive {i}: BLOB header shorter than 16 bytes")
+        if header[8:16] != identity:
+            raise SemanticError(f"archive {i}: BLOB identity mismatch")
+        handles[i] = blob
 
-    expected = file_entry["total_size"]
+    return handles
 
-    if len(output) != expected:
-        raise RuntimeError(
-            f"{file_entry['full_path']}: "
-            f"size mismatch: "
-            f"expected 0x{expected:X}, "
-            f"got 0x{len(output):X}"
+
+def chunks(model, f):
+    base = model["chunk_off"] + f["chunk_rel"]
+    count = f["chunk_bytes"] // CHUNK
+
+    for i in range(count):
+        p = base + i * CHUNK
+        flags = model["logical"][p]
+        archive = model["logical"][p + 1]
+        reserved = model["logical"][p + 2]
+        blob_off = u40(model["logical"], p + 3)
+        decomp = u32(model["logical"], p + 8)
+        comp = u32(model["logical"], p + 0xC)
+        stored = comp or decomp
+
+        if reserved != 0:
+            raise SemanticError("chunk reserved byte is non-zero")
+        if archive >= len(model["archives"]):
+            raise SemanticError("chunk archive index out of range")
+        if (flags == 0x10) != (comp != 0):
+            raise SemanticError("chunk compression flag mismatch")
+
+        yield archive, blob_off, stored, decomp, comp
+
+
+def metadata_root_crc32(model, f):
+    """Return (resource size, CRC32); CRC32 is None when the file has no metadata."""
+    expected_size = f["total_size"]
+    if not f["meta_size"]:
+        # Empty metadata ranges are valid in this corpus. These resources have
+        # no DMKP root, so size can be checked but a metadata CRC cannot.
+        return expected_size, None
+
+    meta = span(
+        model["logical"],
+        model["metadata_off"] + f["meta_rel"],
+        f["meta_size"],
+    )
+    needle = struct.pack("<III", 1, expected_size, 0)
+    hits = []
+    pos = 0
+    while True:
+        pos = meta.find(needle, pos)
+        if pos < 0:
+            break
+        if pos + 16 <= len(meta):
+            hits.append(u32(meta, pos + 12))
+        pos += 1
+
+    if len(hits) != 1:
+        raise SemanticError(
+            f"file {f['index']} ({f['full_name']}): expected exactly one DMKP "
+            f"root header for size {expected_size}, found {len(hits)}"
         )
 
-    return bytes(output), chunks
+    return expected_size, hits[0]
+
+
+def extract_file(model, f, blobs, output):
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    expected_size, expected_crc32 = metadata_root_crc32(model, f)
+    tmp_path = None
+    written = 0
+    crc32 = 0
+
+    try:
+        # Never publish a file before its size and any available metadata CRC32 pass.
+        with tempfile.NamedTemporaryFile(
+            mode="wb", dir=output.parent, prefix=f".{output.name}.", suffix=".tmp", delete=False
+        ) as out:
+            tmp_path = Path(out.name)
+
+            for archive, blob_off, stored, decomp, comp in chunks(model, f):
+                blob = blobs[archive]
+
+                with blob.open("rb") as src:
+                    src.seek(blob_off)
+                    raw = src.read(stored)
+
+                if len(raw) != stored:
+                    raise SemanticError(
+                        f"short BLOB read at 0x{blob_off:x}: "
+                        f"{len(raw)} != {stored}"
+                    )
+
+                if comp:
+                    raw = lz4.block.decompress(raw, uncompressed_size=decomp)
+
+                if len(raw) != decomp:
+                    raise SemanticError("decompressed chunk size mismatch")
+
+                out.write(raw)
+                written += len(raw)
+                crc32 = zlib.crc32(raw, crc32) & 0xFFFFFFFF
+
+            out.flush()
+            os.fsync(out.fileno())
+
+        if written != expected_size:
+            raise SemanticError(
+                f"extracted size {written} != expected size {expected_size}"
+            )
+
+        if expected_crc32 is not None and crc32 != expected_crc32:
+            raise SemanticError(
+                f"CRC32 mismatch for {f['full_name']}: "
+                f"expected 0x{expected_crc32:08x}, got 0x{crc32:08x}"
+            )
+
+        # Re-open the exact file that will be published and validate it again.
+        # This verifies the staged on-disk artifact, not just the streaming state.
+        with tmp_path.open("rb") as check:
+            actual_size = 0
+            actual_crc32 = 0
+            while True:
+                block = check.read(1024 * 1024)
+                if not block:
+                    break
+                actual_size += len(block)
+                actual_crc32 = zlib.crc32(block, actual_crc32) & 0xFFFFFFFF
+
+        if actual_size != expected_size:
+            raise SemanticError(
+                f"final extracted size {actual_size} != expected size {expected_size}"
+            )
+        if expected_crc32 is not None and actual_crc32 != expected_crc32:
+            raise SemanticError(
+                f"final extracted CRC32 mismatch for {f['full_name']}: "
+                f"expected 0x{expected_crc32:08x}, got 0x{actual_crc32:08x}"
+            )
+
+        os.replace(tmp_path, output)
+        tmp_path = None
+
+        if f["meta_size"]:
+            meta = span(
+                model["logical"],
+                model["metadata_off"] + f["meta_rel"],
+                f["meta_size"],
+            )
+            output.with_name(output.name + ".meta").write_bytes(meta)
+
+    finally:
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def safe_output(root, name):
+    p = Path(name)
+    if p.is_absolute() or ".." in p.parts or any(part in ("", ".") for part in p.parts):
+        raise ValueError(f"unsafe output path: {name}")
+    return root.joinpath(*p.parts)
+
+
+def physical_byte_accounting(model):
+    """
+    Account for every physical .rmdtoc byte.
+
+    Categories:
+      structural  = header + descriptor records + descriptor payloads
+      zero_gap    = unreferenced zero bytes
+      nonzero_gap = unreferenced non-zero physical bytes
+
+    The latter are physical storage gaps/padding. They are NOT silently
+    called semantic TOC data.
+    """
+    toc = model["toc"]
+    ranges = [(0, 0x58)]
+
+    for i, d in enumerate(model["descriptor_info"]):
+        p = 0x58 + i * DESCRIPTOR
+        ranges.append((p, p + DESCRIPTOR))
+        ranges.append((d["data_off"], d["data_off"] + d["stored"]))
+
+    merged = _merge(ranges)
+    structural = sum(b - a for a, b in merged)
+
+    zero_gap = 0
+    nonzero_gap = 0
+    pos = 0
+    for a, b in merged:
+        if pos < a:
+            gap = toc[pos:a]
+            zero_gap += gap.count(0)
+            nonzero_gap += len(gap) - gap.count(0)
+        pos = max(pos, b)
+    if pos < len(toc):
+        gap = toc[pos:]
+        zero_gap += gap.count(0)
+        nonzero_gap += len(gap) - gap.count(0)
+
+    total = len(toc)
+    accounted = structural + zero_gap + nonzero_gap
+    if accounted != total:
+        raise SemanticError(
+            f"physical byte accounting failed: "
+            f"{accounted} != {total}"
+        )
+
+    return {
+        "total": total,
+        "structural": structural,
+        "zero_gap": zero_gap,
+        "nonzero_gap": nonzero_gap,
+    }
+
+
+def logical_byte_accounting(model):
+    """
+    Account every logical TOC byte as one of the semantic sections or
+    zero alignment padding between sections.
+    """
+    logical = model["logical"]
+    toc = model["toc"]
+    ranges = [
+        ("archive", 0, u32(toc, 0x14) * ARCHIVE),
+        ("path", u32(toc, 0x18), u32(toc, 0x18) + u32(toc, 0x1C) * PATH),
+        ("file", u32(toc, 0x20), u32(toc, 0x20) + u32(toc, 0x24) * FILE),
+        ("strings", u32(toc, 0x28), u32(toc, 0x28) + u32(toc, 0x2C)),
+        ("metadata_type", u32(toc, 0x30),
+         u32(toc, 0x30) + u32(toc, 0x34) * 8),
+        ("metadata", u32(toc, 0x38),
+         u32(toc, 0x38) + u32(toc, 0x3C)),
+        ("chunk", u32(toc, 0x50),
+         u32(toc, 0x50) + u32(toc, 0x54)),
+    ]
+
+    known = 0
+    zero_padding = 0
+    for _, a, z in ranges:
+        known += z - a
+    for (_, _, z1), (_, a2, _) in zip(ranges, ranges[1:]):
+        if z1 < a2:
+            gap = logical[z1:a2]
+            zero_padding += len(gap)
+            if any(gap):
+                raise SemanticError("non-zero logical section padding")
+
+    total = len(logical)
+    accounted = known + zero_padding
+    if accounted != total:
+        raise SemanticError(
+            f"logical byte accounting failed: {accounted} != {total}"
+        )
+
+    return total, known, zero_padding
+
+
+def summarize(models):
+    total_logical = sum(len(m["logical"]) for m in models)
+    total_files = sum(len(m["files"]) for m in models)
+    total_paths = sum(len(m["paths"]) for m in models)
+    total_archives = sum(len(m["archives"]) for m in models)
+    total_chunks = sum(m["chunk_count"] for m in models)
+    total_types = sum(m["metadata_type_count"] for m in models)
+    total_metadata = sum(m["metadata_size"] for m in models)
+
+    type_counts = {}
+    for m in models:
+        for f in m["files"]:
+            t = extension(f["name"])
+            type_counts[t] = type_counts.get(t, 0) + 1
+
+    physical = [physical_byte_accounting(m) for m in models]
+    logical = [logical_byte_accounting(m) for m in models]
+
+    semantic_total = sum(m["semantic_checks"].total for m in models)
+    semantic_failed = sum(m["semantic_checks"].failed for m in models)
+    semantic_passed = semantic_total - semantic_failed
+
+    print("=" * 72)
+    print("CONTROL RESONANT RMDTOC")
+    print("=" * 72)
+    print(f"TOC files     : {len(models):,}")
+    print(f"Archives      : {total_archives:,}")
+    print(f"Paths         : {total_paths:,}")
+    print(f"Files         : {total_files:,}")
+    print(f"Chunks        : {total_chunks:,}")
+    print(f"Metadata types: {total_types:,}")
+    print(f"Metadata      : {total_metadata:,} bytes")
+    print(f"Logical data  : {total_logical:,} bytes")
+    print()
+
+    physical_total = sum(x["total"] for x in physical)
+    physical_accounted = sum(
+        x["structural"] + x["zero_gap"] + x["nonzero_gap"]
+        for x in physical
+    )
+    physical_nonzero_gap = sum(x["nonzero_gap"] for x in physical)
+
+    logical_total = sum(x[0] for x in logical)
+    logical_accounted = sum(x[1] + x[2] for x in logical)
+
+    print("BYTE ACCOUNTING")
+    print(f"  Physical TOC : {100.0 * physical_accounted / physical_total:.6f}%")
+    print(f"  Logical TOC  : {100.0 * logical_accounted / logical_total:.6f}%")
+    print(f"  Physical gap : {physical_nonzero_gap:,} non-zero bytes")
+    print(f"  Unaccounted  : {physical_total - physical_accounted:,} bytes")
+    print()
+
+    print("SEMANTIC CHECK")
+    semantic_pct = (
+        100.0 * semantic_passed / semantic_total
+        if semantic_total else 100.0
+    )
+    print(f"  Checks       : {semantic_passed:,}/{semantic_total:,}")
+    print(f"  Coverage     : {semantic_pct:.6f}%")
+    print(f"  Failures     : {semantic_failed:,}")
+    print()
+
+    print("VALIDATION GROUPS")
+    group_names = []
+    for model in models:
+        for name in model["semantic_groups"]:
+            if name not in group_names:
+                group_names.append(name)
+    for name in group_names:
+        total = sum(m["semantic_groups"].get(name, {}).get("total", 0) for m in models)
+        passed = sum(m["semantic_groups"].get(name, {}).get("passed", 0) for m in models)
+        failed = sum(m["semantic_groups"].get(name, {}).get("failed", 0) for m in models)
+        print(f"  {name:32s}: {passed:,}/{total:,} passed; failures={failed:,}")
+    print()
+
+    print("METADATA")
+    versions = {}
+    for m in models:
+        for version, count in m["metadata_versions"].items():
+            versions[version] = versions.get(version, 0) + count
+    print(f"  DMKP records : {sum(m['metadata_magic_count'] for m in models):,}")
+    print(
+        "  Versions     : "
+        + ", ".join(f"v{k}={v:,}" for k, v in sorted(versions.items()))
+    )
+
+    print()
+    print("CHUNKS")
+    compressed = sum(m["compressed_chunks"] for m in models)
+    stored = sum(m["stored_chunks"] for m in models)
+    print(f"  LZ4          : {compressed:,}")
+    print(f"  Stored/raw   : {stored:,}")
+
+    print()
+    print("FILE TYPES")
+    for t, n in sorted(type_counts.items(), key=lambda x: (-x[1], x[0])):
+        print(f"  {t:18s} {n:,}")
+
+    if semantic_failed:
+        print()
+        print("STATUS       : FAIL")
+    else:
+        print()
+        print("STATUS       : PASS")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Extract selected file types from Northlight .rmdtoc/.rmdblob"
-    )
+        description=(
+            "Strict Control Resonant .rmdtoc/.rmdblob parser, semantic "
+            "validator and unpacker."
+        ),
+        epilog="""examples:
+  python3 script.py /path/to/CONTROLresonant
+      Validate all .rmdtoc files and print byte/semantic statistics.
 
+  python3 script.py --filetype wem,tex /path/to/CONTROLresonant
+      Validate first, then extract selected files.
+
+  python3 script.py --filetype all /path/to/CONTROLresonant
+      Validate first, then extract every referenced file.
+""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument(
         "--filetype",
-        type=str,
-        default=None,
-        help="Comma-separated file types to extract, e.g. tex,wem,css",
+        help="Comma-separated types to extract, e.g. wem,tex; use all for everything.",
     )
-
     parser.add_argument(
-        "--count",
-        type=int,
-        default=None,
-        help="Limit number of selected assets to extract (default: all)",
-    )
-
-    parser.add_argument(
-        "toc",
+        "--out",
         type=Path,
-        help="Path to .rmdtoc file",
+        help="Output directory (default: <script directory>/output).",
     )
+    parser.add_argument(
+        "--no-fail",
+        action="store_true",
+        help="Do not return exit code 1 when semantic validation fails.",
+    )
+    parser.add_argument("path", nargs="?", type=Path)
 
     args = parser.parse_args()
 
-    toc_dir = args.toc.parent
-    out_dir = args.toc.parent / "extracted"
+    if args.path is None:
+        parser.print_help()
+        return 0
 
-    print("=" * 100)
-    print("CONTROL RESONANT ASSET EXTRACTION KIT")
-    print("=" * 100)
+    toc_paths = discover(args.path)
+    if not toc_paths:
+        raise SystemExit(f"no .rmdtoc files found under {args.path}")
 
-    print(f"TOC = {args.toc}")
-    print(f"OUT = {out_dir}")
+    models = []
+    failures = []
 
-    toc = args.toc.read_bytes()
+    for toc_path in toc_paths:
+        try:
+            models.append(decode_toc(toc_path))
+        except (SemanticError, AssertionError, struct.error, lz4.block.LZ4BlockError) as e:
+            failures.append((toc_path, str(e)))
 
-    h = parse_header(toc)
-    full = reconstruct_logical_toc(toc, h)
+    if failures:
+        print("=" * 72)
+        print("SEMANTIC VALIDATION FAILURES")
+        print("=" * 72)
+        for path, error in failures:
+            print(f"{path}: {error}")
+        if not args.no_fail:
+            return 1
 
-    print(f"logical TOC = {len(full):,} (0x{len(full):X})")
+    if models:
+        summarize(models)
 
-    # ------------------------------------------------------------------
-    # Validate logical tables.
-    # ------------------------------------------------------------------
-    check_table(
-        full,
-        h,
-        "Archive",
-        "archives_off",
-        "archives_count",
-        ARCHIVE_SIZE,
+    if failures and not args.no_fail:
+        return 1
+
+    if args.filetype is None:
+        return 0
+
+    requested = {x.strip().lower() for x in args.filetype.split(",") if x.strip()}
+    if not requested:
+        raise SystemExit("--filetype is empty")
+
+    extract_all = "all" in requested
+    if extract_all:
+        requested = set()
+
+    out_root = (
+        args.out
+        if args.out is not None
+        else Path(__file__).resolve().parent / "output"
     )
 
-    check_table(
-        full,
-        h,
-        "Path",
-        "paths_off",
-        "paths_count",
-        PATH_SIZE,
+    requested_extensions = {"." + x.lstrip(".") for x in requested}
+    total_to_extract = sum(
+        1
+        for model in models
+        for f in model["files"]
+        if extract_all or extension(f["name"]) in requested_extensions
     )
 
-    check_table(
-        full,
-        h,
-        "File",
-        "files_off",
-        "files_count",
-        FILE_SIZE,
-    )
-
-    # ------------------------------------------------------------------
-    # Build BLOBS from archives table (handles ../pc/ and ../generic/)
-    # ------------------------------------------------------------------
-    BLOBS = {}
-    aoff = h["archives_off"]
-    acnt = h["archives_count"]
-    soff = h["strings_off"]
-
-    for i in range(acnt):
-        p = aoff + i * ARCHIVE_SIZE
-
-        name_off = u32(full, p + 0x00)
-        name_len = u32(full, p + 0x04)
-
-        raw = full[
-            soff + name_off:
-            soff + name_off + name_len
-        ]
-
-        if (
-            soff + name_off < soff
-            or soff + name_off + name_len
-            > soff + h["strings_size"]
-        ):
-            raise RuntimeError(
-                f"Archive {i} name outside string table: "
-                f"off=0x{name_off:X}, size=0x{name_len:X}"
-            )
-
-        rel = raw.split(b"\0")[0].decode(
-            "utf-8",
-            "replace"
-        )
-
-        candidate = (toc_dir / rel).resolve()
-
-        if not candidate.is_file():
-            candidate = toc_dir / Path(rel).name
-
-        if candidate.is_file():
-            BLOBS[i] = candidate
-            print(
-                f"  archive {i} -> {candidate}  "
-                f"({candidate.stat().st_size:,} bytes)"
-            )
-        else:
-            print(
-                f"WARNING: archive {i} → {rel} not found"
-            )
-
-    paths = parse_paths(full, h)
-    print(f"paths = {len(paths):,}")
-
-    files = parse_files(full, h, paths)
-
-    # ------------------------------------------------------------------
-    # FILE TYPE INVENTORY
-    # ------------------------------------------------------------------
-    type_counts = {}
-
-    for f in files:
-        filename = f["name"]
-
-        if "." in filename:
-            file_type = "." + filename.rsplit(".", 1)[1].lower()
-        else:
-            file_type = "<no extension>"
-
-        type_counts[file_type] = (
-            type_counts.get(file_type, 0) + 1
-        )
-
-    print()
-    print("=" * 100)
-    print("AVAILABLE FILE TYPES")
-    print("=" * 100)
-
-    for file_type, count in sorted(
-        type_counts.items(),
-        key=lambda item: (-item[1], item[0]),
-    ):
-        print(f"{file_type:20s} {count:,}")
-
-    # ------------------------------------------------------------------
-    # SELECT FILE TYPES
-    # ------------------------------------------------------------------
-    selected_types = set()
-
-    if args.filetype:
-        for value in args.filetype.split(","):
-            value = value.strip().lower()
-
-            if not value:
+    extracted = 0
+    for model in models:
+        blobs = resolve_blobs(model)
+        for f in model["files"]:
+            if not extract_all and extension(f["name"]) not in requested_extensions:
                 continue
 
-            if value == "all":
-                selected_types.update(type_counts)
-                continue
+            output = safe_output(out_root, f["full_name"])
+            extract_file(model, f, blobs, output)
 
-            if (
-                value != "<no extension>"
-                and not value.startswith(".")
-            ):
-                value = "." + value
-
-            selected_types.add(value)
-
-
-    if not selected_types:
-        print()
-        print("No file type selected.")
-        print("Use --filetype to select one or more types, for example:")
-        print("  python3 script.py --filetype=tex base-generic.rmdtoc")
-        print("  python3 script.py --filetype=wem base-generic.rmdtoc")
-        print(
-            "  python3 script.py "
-            "--filetype=tex,wem,css --count 10 base-generic.rmdtoc"
-        )
-        return
-
-    selected = [
-        f
-        for f in files
-        if (
-            (
-                "." + f["name"].rsplit(".", 1)[1].lower()
-            )
-            if "." in f["name"]
-            else "<no extension>"
-        ) in selected_types
-    ]
-
-    if args.count is not None:
-        if args.count < 0:
-            parser.error("--count must be >= 0")
-
-        selected = selected[:args.count]
-
-    print()
-    print("=" * 100)
-    print("SELECTED FILE TYPES")
-    print("=" * 100)
-
-    for file_type in sorted(selected_types):
-        print(
-            f"{file_type:20s} "
-            f"{type_counts.get(file_type, 0):,}"
-        )
-
-    print(f"selected = {len(selected):,}")
-
-    needed_archives = set()
-
-    for f in selected:
-        chunks = get_file_chunks(full, h, f)
-
-        for c in chunks:
-            needed_archives.add(c["archive"])
-
-    # Open blob files as handles — do NOT load entire blobs into RAM
-    blob_handles = {}
-
-    for archive in sorted(needed_archives):
-        path = BLOBS.get(archive)
-
-        if path is None:
+            extracted += 1
+            pct = extracted / total_to_extract * 100 if total_to_extract else 100.0
             print(
-                f"WARNING: archive {archive} has no known blob"
-            )
-            continue
-
-        if not path.exists():
-            print(
-                f"WARNING: blob missing for archive {archive}: {path}"
-            )
-            continue
-
-        print(f"archive {archive} -> {path}")
-        blob_handles[archive] = open(path, "rb")
-
-    print()
-    print("=" * 100)
-    print(f"EXTRACTING {len(selected)} ASSETS")
-    print("=" * 100)
-
-    ok = 0
-
-    try:
-        for n, f in enumerate(selected):
-            print()
-            print(f"[{n:03d}] {f['full_path']}")
-            print(
-                f"      size = 0x{f['total_size']:X} "
-                f"({f['total_size']:,})"
+                f"\rExtracted {extracted}/{total_to_extract} ({pct:.0f}%)",
+                end="",
+                flush=True,
             )
 
-            try:
-                file_data, chunks = extract_file_bytes(
-                    full,
-                    h,
-                    f,
-                    blob_handles
-                )
-
-                print(f"      chunks = {len(chunks)}")
-
-                for c in chunks:
-                    print(
-                        f"        archive={c['archive']} "
-                        f"blob=0x{c['blob_off']:X} "
-                        f"stored=0x{c['stored']:X} "
-                        f"decomp=0x{c['decomp']:X} "
-                        f"comp=0x{c['comp']:X}"
-                    )
-
-                ok += 1
-
-                output_path = safe_output_path(
-                    out_dir,
-                    f["full_path"],
-                )
-
-                output_path.parent.mkdir(
-                    parents=True,
-                    exist_ok=True,
-                )
-
-                output_path.write_bytes(file_data)
-
-                print(f"      FILE -> {output_path}")
-
-                # Added missing metadata extraction needed for further file decoding
-                meta_size = f["metadata_size"]
-                if meta_size:
-                    meta_base = h["metadata_off"]
-                    meta_start = meta_base + f["metadata_off"]
-                    meta_end = meta_start + meta_size
-
-                    if meta_start < meta_base or meta_end > meta_base + h["metadata_size"]:
-                        raise RuntimeError(
-                            f"{f['full_path']}: metadata range outside metadata table: "
-                            f"off=0x{f['metadata_off']:X}, size=0x{meta_size:X}"
-                        )
-
-                    if meta_end > len(full):
-                        raise RuntimeError(
-                            f"{f['full_path']}: metadata range outside logical TOC"
-                        )
-
-                    metadata = full[meta_start:meta_end]
-                    metadata_path = Path(str(output_path) + ".meta")
-                    metadata_path.write_bytes(metadata)
-                    print(f"      META -> {metadata_path} (0x{len(metadata):X} bytes)")
-
-            except Exception as e:
-                print(f"      ERROR: {e}")
-
-    finally:
-        for fh in blob_handles.values():
-            fh.close()
-
     print()
-    print("=" * 100)
-    print("RESULT")
-    print("=" * 100)
-    print(f"selected = {len(selected)}")
-    print(f"extracted = {ok}")
-    print(f"failed = {len(selected) - ok}")
-
-    print()
-    print("=" * 100)
-    print("DONE")
-    print("=" * 100)
+    print(f"Extracted {extracted:,} files to {out_root}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
